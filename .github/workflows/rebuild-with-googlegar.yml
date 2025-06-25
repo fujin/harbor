@@ -1,0 +1,202 @@
+name: Rebuild Harbor with GoogleGAR Adapter
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: fujin/harbor
+
+jobs:
+  build-go-components:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.24.3"
+          cache: true
+          cache-dependency-path: src/go.sum
+
+      - name: Build Go binaries with GoogleGAR adapter
+        run: |
+          export GOBUILDTAGS="include_oss include_gcs"
+          export GITCOMMIT=$(git rev-parse --short=8 HEAD)
+          export RELEASEVERSION=$(cat VERSION)
+          make compile
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: harbor-binaries
+          path: |
+            make/photon/core/harbor_core
+            make/photon/jobservice/harbor_jobservice
+            make/photon/registryctl/harbor_registryctl
+
+  build-portal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "16"
+          cache: "npm"
+          cache-dependency-path: src/portal/package-lock.json
+
+      - name: Build Angular frontend
+        run: |
+          cd src/portal
+          npm ci
+          npm run release
+
+      - name: Upload portal dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: portal-dist
+          path: src/portal/dist
+
+  build-and-push:
+    needs: [build-go-components, build-portal]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: harbor-binaries
+          path: .
+
+      - name: Download portal dist
+        uses: actions/download-artifact@v4
+        with:
+          name: portal-dist
+          path: src/portal/dist
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Debug binary locations
+        run: |
+          echo "=== Checking binary locations after download ==="
+          find . -name "harbor_core" -o -name "harbor_jobservice" -o -name "harbor_registryctl"
+          echo "=== Contents of make/photon/core/ ==="
+          ls -la make/photon/core/ || echo "Directory does not exist"
+          echo "=== Contents of current directory ==="
+          ls -la
+
+      - name: Build Harbor images using Makefile
+        run: |
+          # Set build variables for Harbor Makefile (includes GoogleGAR adapter)
+          export GOBUILDTAGS="include_oss include_gcs"
+          export VERSIONTAG="dev"
+          export IMAGENAMESPACE="goharbor"
+          export BASEIMAGETAG="dev"
+          export DEVFLAG="true"
+          export TRIVYFLAG="false"
+          export BUILD_BASE="false"
+          export PULL_BASE_FROM_DOCKERHUB="true"
+          
+          # Create versions file (required by Harbor Dockerfiles)
+          make versions_prepare
+          
+          # Build all Harbor images using the Makefile (handles all dependencies and build args)
+          make build
+
+      - name: Retag and push images to GHCR with metadata
+        run: |
+          # Harbor images built by make build
+          IMAGES=(
+            "goharbor/harbor-core:dev"
+            "goharbor/harbor-portal:dev" 
+            "goharbor/harbor-jobservice:dev"
+            "goharbor/harbor-registryctl:dev"
+            "goharbor/registry-photon:dev"
+            "goharbor/harbor-db:dev"
+            "goharbor/harbor-log:dev"
+            "goharbor/redis-photon:dev"
+            "goharbor/nginx-photon:dev"
+            "goharbor/prepare:dev"
+          )
+          
+          # Generate metadata tags using docker/metadata-action pattern
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-8)
+          TIMESTAMP=$(date +%s)
+          BRANCH_TAG="${{ github.ref_name }}-${SHORT_SHA}-${TIMESTAMP}"
+          
+          for image in "${IMAGES[@]}"; do
+            # Extract image name
+            if [[ $image == goharbor/* ]]; then
+              image_name=$(echo $image | sed 's/goharbor\///' | sed 's/:dev//')
+            else
+              image_name=$(echo $image | sed 's/:dev//')
+            fi
+            
+            # GHCR image paths
+            GHCR_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${image_name}"
+            
+            echo "🏷️  Retagging ${image} → ${image_name}..."
+            
+            # Retag with proper GitHub repository metadata labels
+            docker build -t "${GHCR_IMAGE}:${BRANCH_TAG}" \
+              --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+              --label "org.opencontainers.image.description=Harbor container registry - ${image_name} with GoogleGAR adapter" \
+              --label "org.opencontainers.image.vendor=Harbor" \
+              --label "org.opencontainers.image.version=${{ github.sha }}" \
+              --label "org.opencontainers.image.revision=${{ github.sha }}" \
+              --label "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+              --label "org.opencontainers.image.url=https://github.com/${{ github.repository }}" \
+              --label "org.opencontainers.image.documentation=https://github.com/${{ github.repository }}" \
+              --label "org.opencontainers.image.title=${image_name}" \
+              - <<< "FROM $image"
+              
+            docker build -t "${GHCR_IMAGE}:latest" \
+              --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+              --label "org.opencontainers.image.description=Harbor container registry - ${image_name} with GoogleGAR adapter" \
+              --label "org.opencontainers.image.vendor=Harbor" \
+              --label "org.opencontainers.image.version=${{ github.sha }}" \
+              --label "org.opencontainers.image.revision=${{ github.sha }}" \
+              --label "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+              --label "org.opencontainers.image.url=https://github.com/${{ github.repository }}" \
+              --label "org.opencontainers.image.documentation=https://github.com/${{ github.repository }}" \
+              --label "org.opencontainers.image.title=${image_name}" \
+              - <<< "FROM $image"
+            
+            # Push both tags
+            echo "📤 Pushing ${image_name}..."
+            docker push "${GHCR_IMAGE}:${BRANCH_TAG}"
+            docker push "${GHCR_IMAGE}:latest"
+            
+            echo "✅ Successfully pushed ${image_name} to GHCR"
+          done
+          
+          echo ""
+          echo "🎉 All Harbor images with GoogleGAR adapter built and pushed!"
+          echo "📦 Available at: https://github.com/${{ github.repository_owner }}?tab=packages&repo_name=${{ github.event.repository.name }}"
